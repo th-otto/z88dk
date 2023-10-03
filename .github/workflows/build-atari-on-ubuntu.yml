@@ -1,0 +1,125 @@
+name: build-atari-on-ubuntu
+
+on:
+  push:
+  pull_request:
+    branches: [ master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu_target: [ "000", "020", "v4e" ]
+        target: [ m68k-atari-mint ]
+        include:
+          - cpu_target: 000
+            cpu_cflags: -m68000
+          - cpu_target: 020
+            cpu_cflags: -m68020-60
+          - cpu_target: v4e
+            cpu_cflags: -mcpu=5475
+    steps:
+    - name: Checkout from git
+      uses: actions/checkout@v3
+      with:
+        submodules: 'true'
+    - name: Install m68k-atari-mint cross-compiler
+      env:
+        TARGET: ${{ matrix.target }}
+      run: |
+        DOWNLOAD_DIR=http://tho-otto.de/snapshots
+        toolsuffix=${TARGET##*-}
+        wget -q -O - "$DOWNLOAD_DIR/binutils/binutils-2.41-ubuntu-20.04-${toolsuffix}.tar.xz" | sudo tar -C / -xJf -
+        wget -q -O - "$DOWNLOAD_DIR/gcc/gcc-9.5.0-ubuntu-20.04-${toolsuffix}.tar.xz" | sudo tar -C / -xJf -
+    - name: Install m68k-atari-mint libraries
+      env:
+        TARGET: ${{ matrix.target }}
+      run: |
+        DOWNLOAD_DIR=http://tho-otto.de/download/mint
+        toolsuffix=${TARGET##*-}
+        for package in mintlib-0.60.1 fdlibm libxml2-2.10.3 zlib-1.2.13 xz-5.4.4 libiconv-1.17
+        do
+          wget -q -O - "$DOWNLOAD_DIR/${package}-${toolsuffix}-dev.tar.xz" | sudo tar -C / -xJf -
+        done
+    - name: Update apt
+      run: |
+        sudo apt-get update -y
+    - name: Install apt dependencies
+      run: |
+        sudo apt install -y build-essential bison flex libxml2-dev subversion zlib1g-dev m4 ragel re2c dos2unix texinfo texi2html gdb curl cpanminus libboost-all-dev libmodern-perl-perl libyaml-perl liblocal-lib-perl libcapture-tiny-perl libpath-tiny-perl libtext-table-perl libdata-hexdump-perl libregexp-common-perl libclone-perl libfile-slurp-perl
+    - name: Install perl prerequisites
+      run: |
+        cpanm --local-lib=~/perl5 App::Prove Clone CPU::Z80::Assembler Data::Dump Data::HexDump File::Path List::Uniq Modern::Perl Object::Tiny::RW Regexp::Common Test::Harness Text::Diff Text::Table YAML::Tiny
+    - name: Set environment
+      env:
+        CPU_TARGET: ${{ matrix.cpu_target }}
+      run: |
+        set -ex
+        eval $(perl -I ~/perl5/lib/perl5/ -Mlocal::lib)
+        builddir=$(pwd)
+        mkdir -p $builddir/bin
+        export ZCCCFG=$builddir/lib/config
+        mkdir -p $ZCCCFG
+        DESTDIR=$(mktemp -d)
+        PREFIX=/usr/local
+        export PATH=$builddir/bin:$PATH
+        echo PATH=$PATH >> $GITHUB_ENV
+        echo ZCCCFG=$ZCCCFG >> $GITHUB_ENV
+        echo PREFIX=${PREFIX} >> $GITHUB_ENV
+        echo DESTDIR=${DESTDIR} >> $GITHUB_ENV
+        echo CPU_TARGET=$CPU_TARGET >> $GITHUB_ENV
+        echo PERL_MB_OPT=\'"$PERL_MB_OPT"\' >> $GITHUB_ENV
+        echo PERL_MM_OPT=\'"$PERL_MM_OPT"\' >> $GITHUB_ENV
+        echo PERL5LIB="$PERL5LIB" >> $GITHUB_ENV
+        echo PERL_LOCAL_LIB_ROOT="$PERL_LOCAL_LIB_ROOT" >> $GITHUB_ENV
+    - name: Build host binaries
+      run: |
+        set -ex
+        ./build.sh -v -l
+    - name: Build libraries
+      run: |
+        set -ex
+        ./build.sh -v -b
+        make DESTDIR=${DESTDIR} PREFIX=${PREFIX} install
+    - name: Build examples
+      run: |
+        set -ex
+        ./build.sh -v -b -l -e
+    - name: Build target binaries
+      env:
+        TARGET: ${{ matrix.target }}
+        CPU_CFLAGS: ${{ matrix.cpu_cflags }}
+      run: |
+        set -ex
+        make clean || :
+        rm -rf bin
+        export CFLAGS="-O2 -fomit-frame-pointer ${CPU_CFLAGS}"
+        export CC=${TARGET}-gcc
+        export CXX=${TARGET}-g++
+        export CROSS=1
+        export PKG_CONFIG_PATH=/usr/${TARGET}/lib/pkgconfig/
+        ./build.sh -v -l
+        make DESTDIR=${DESTDIR} PREFIX=${PREFIX} install
+        ${TARGET}-strip ${DESTDIR}${PREFIX}/bin/* || :
+        rm -f ${DESTDIR}${PREFIX}/bin/z80asm
+        ln ${DESTDIR}${PREFIX}/bin/z88dk-z80asm ${DESTDIR}${PREFIX}/bin/z80asm
+        ls ${DESTDIR}${PREFIX}/share/z88dk/lib/clibs/
+    - name: Build snapshot archive
+      env:
+        TARGET: ${{ matrix.target }}
+      run: |
+        builddir=$(pwd)
+        cd ${DESTDIR}
+        rm -f $builddir/z88dk-${TARGET}-${CPU_TARGET}.zip
+        zip -r $builddir/z88dk-${TARGET}-${CPU_TARGET}.zip *
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: z88dk-${{ matrix.target }}-${{ matrix.cpu_target }}
+        path: z88dk-${{ matrix.target }}-${{ matrix.cpu_target }}.zip
